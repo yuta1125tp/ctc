@@ -1,19 +1,36 @@
-# https://github.com/chainer/chainer/blob/v7.4.0/chainer/functions/loss/ctc.py
-import numpy
-import six
+# just adjust chainer's ctc to torch.
+# [chainer/functions/loss/ctc.py](https://github.com/chainer/chainer/blob/v7.4.0/chainer/functions/loss/ctc.py)
 
-import chainer
-from chainer import backend
-from chainer.backends import cuda
-from chainer import function
-from chainer import utils
-from chainer.utils import collections_abc
-from chainer.utils import type_check
+# pylint: disable=E1101 # ignore "Module '' has no '' member "
+
+
+import numpy
+import torch
+from torch import functional as F
+from torch import nn
+
+
+def get_array_module(arr):
+    if isinstance(arr, torch.Tensor):
+        return torch
+    else:
+        return backend.get_array_module(arr)
+
+
+def int_dtype(xp):
+    return torch.long if xp is torch else xp.int32
+
+
+def inv_slice(length, **kwargs):
+    return torch.arange(length-1, -1, -1, dtype=torch.long, **kwargs)
 
 
 def _logsumexp(a, xp, axis=None):
-    vmax = xp.amax(a, axis=axis, keepdims=True)
-    if xp is numpy:
+    if xp is torch:
+        vmax, _vidx = xp.max(a, dim=axis, keepdims=True)
+    else:
+        vmax = xp.amax(a, axis=axis, keepdims=True)
+    if xp is numpy or xp is torch:
         vmax += xp.log(xp.sum(xp.exp(a - vmax),
                               axis=axis, keepdims=True, dtype=a.dtype))
     else:
@@ -25,15 +42,9 @@ def _logsumexp(a, xp, axis=None):
     return xp.squeeze(vmax, axis=axis)
 
 
-def _softmax(x, xp):
-    val = xp.exp(x - xp.amax(x, axis=2, keepdims=True))
-    val /= xp.sum(val, axis=2, keepdims=True)
-    return val
-
-
 def _label_to_path(labels, blank_symbol, xp):
     path = xp.full((len(labels), labels.shape[1] * 2 + 1),
-                   blank_symbol, dtype=numpy.int32)
+                   blank_symbol, dtype=int_dtype(xp))
     path[:, 1::2] = labels
     return path
 
@@ -55,8 +66,12 @@ def _flip_path(path, path_length, xp):
     """
     n_batch, n_label = path.shape
     rotate = (xp.arange(n_label) + path_length[:, None]) % n_label
-    return path[xp.arange(n_batch, dtype=xp.int32)[:, None],
-                rotate][:, ::-1]
+    if xp is torch:
+        _slice = inv_slice(n_label)
+    else:
+        _slice = slice(None, None, -1)
+    return path[xp.arange(n_batch, dtype=int_dtype(xp))[:, None],
+                rotate][:, _slice]
 
 
 def _flip_label_probability(y, input_length, xp):
@@ -70,11 +85,16 @@ def _flip_label_probability(y, input_length, xp):
 
     """
     seq, n_batch, n_vocab = y.shape
-    rotate = (xp.arange(seq, dtype=xp.int32)[:, None] + input_length) % seq
+    rotate = (xp.arange(seq, dtype=int_dtype(xp))
+              [:, None] + input_length) % seq
+    if xp is torch:
+        _slice = inv_slice(seq)
+    else:
+        _slice = slice(None, None, -1)
     return y[
         rotate[:, :, None],
-        xp.arange(n_batch, dtype=xp.int32)[None, :, None],
-        xp.arange(n_vocab, dtype=xp.int32)[None, None, :]][::-1]
+        xp.arange(n_batch, dtype=int_dtype(xp))[None, :, None],
+        xp.arange(n_vocab, dtype=int_dtype(xp))[None, None, :]][_slice]
 
 
 def _flip_path_probability(prob, input_length, path_length, xp):
@@ -88,329 +108,200 @@ def _flip_path_probability(prob, input_length, path_length, xp):
 
     """
     seq, n_batch, n_label = prob.shape
-    rotate_input = ((xp.arange(seq, dtype=xp.int32)[:, None] + input_length)
+    rotate_input = ((xp.arange(seq, dtype=int_dtype(xp))[:, None] + input_length)
                     % seq)
-    rotate_label = ((xp.arange(n_label, dtype=xp.int32) + path_length[:, None])
+    rotate_label = ((xp.arange(n_label, dtype=int_dtype(xp)) + path_length[:, None])
                     % n_label)
-    return prob[
-        rotate_input[:, :, None],
-        xp.arange(n_batch, dtype=xp.int32)[None, :, None],
-        rotate_label][::-1, :, ::-1]
+    if xp is torch:
+        _slice0 = inv_slice(seq)
+        _slice2 = inv_slice(n_label)
+        return prob[
+            rotate_input[:, :, None],
+            xp.arange(n_batch, dtype=int_dtype(xp))[None, :, None],
+            rotate_label][_slice0][:, :, _slice2]
+    else:
+        return prob[
+            rotate_input[:, :, None],
+            xp.arange(n_batch, dtype=int_dtype(xp))[None, :, None],
+            rotate_label][::-1, :, ::-1]
 
 
-class ConnectionistTemporalClassification(function.Function):
+# path probability to label probability
+def label_probability(label_size, path, path_length,
+                      multiply_seq, xp):
+    seq_length = len(multiply_seq)
+    n_batch = len(path)
+    dtype = multiply_seq.dtype
 
-    """The implementation of Connectionist Temporal Classfication loss functions.
+    ret = xp.zeros((seq_length, n_batch, label_size), dtype=dtype)
+    if xp is numpy or xp is torch:
+        for b in range(len(path)):
+            target_path = path[b, :path_length[b]]
+            chars = {c for c in target_path}
+            for c in chars:
+                ret[:, b, c] = xp.sum(
+                    multiply_seq[:, b, 0:path_length[b]]
+                    [:, target_path == c], axis=1)
+    else:
+        utils.nondeterministic('atomicAdd')
+        cuda.elementwise(
+            'T prob, I path, I path_length, I max_path_length',
+            'raw T cum_prob',
+            '''
+            I t = i % max_path_length;
+            if (t < path_length) {
+                int n_batch = cum_prob.shape()[1];
+                I s = i / (max_path_length * n_batch);
+                I b = (i - s * (max_path_length * n_batch))
+                    / max_path_length;
+                int ind[] = {s, b, path};
+                atomicAdd(&cum_prob[ind], prob);
+            }
+            ''', 'ctc_label_prob_sum'
+        )(multiply_seq, path, path_length[:, None], path.shape[1], ret)
+    return ret
 
-    To make it usable for real-world cases, this class has two policies below.
-    1. This class computes forward and backward variables in the log domain.
-    2. This class applies the softmax function to inputs. The Backward
-    values of CTC loss is often overflows. This is avoided by computing
-    backward values before the activation function is applied.
-    """
 
-    def __init__(self, blank_symbol, reduce='mean'):
-        self.blank_symbol = blank_symbol
-        # Lazily initialized in the first forward computation for dtype
-        self.zero_padding = None
+def _computes_transition(
+        prev_prob, path, path_length, cum_prob, y, zero_padding):
+    xp = get_array_module(prev_prob)
 
-        if reduce not in ('mean', 'no'):
-            raise ValueError(
-                'only \'mean\' and \'no\' are valid '
-                'for \'reduce\', but \'%s\' is given' % reduce)
-        self.reduce = reduce
+    if xp is numpy or xp is torch:
+        n_batch, max_path_length = path.shape
+        mat = xp.full(
+            (3, n_batch, max_path_length), zero_padding, dtype=y.dtype)
+        mat[0, :, :] = prev_prob
+        mat[1, :, 1:] = prev_prob[:, :-1]
+        mat[2, :, 2:] = prev_prob[:, :-2]
+        # disable transition between the same symbols
+        # (including blank-to-blank)
+        same_transition = (path[:, :-2] == path[:, 2:])
+        mat[2, :, 2:][same_transition] = zero_padding
+        prob = _logsumexp(mat, xp, axis=0)
+        outside = xp.arange(max_path_length) >= path_length[:, None]
+        prob[outside] = zero_padding
+        cum_prob += prob
+        batch_index = xp.arange(n_batch, dtype=int_dtype(xp))
+        prob += y[batch_index[:, None], path]
+    else:
+        prob = xp.empty_like(prev_prob)
+        cuda.elementwise(
+            'raw T prob, raw I path, I path_length, T zero, raw T y',
+            'T z, T cum_prob',
+            '''
+            int length = prob.shape()[1];
+            int b = i / length;
+            int t = i - b * length;
+            if (t >= path_length) {
+                z = zero;
+                cum_prob += zero;
+                return;
+            }
+            int ind1[] = {b, t};
+            int ind2[] = {b, t - 1};
+            int ind3[] = {b, t - 2};
+            T f1 = prob[ind1];
+            T f2 = (0 <= t - 1) ? prob[ind2] : zero;
+            T f3 = (0 <= t - 2 && path[ind3] != path[ind1]) ?
+                prob[ind3] : zero;
 
-    def check_type_forward(self, in_types):
-        type_check._argname(
-            in_types, ('input_length', 'label_length', 't', 'x'))
-        input_length_type, label_length_type, t_type, x_type = in_types
-        type_check.expect(
-            input_length_type.dtype == numpy.int32,
-            input_length_type.ndim == 1,
-            label_length_type.dtype == numpy.int32,
-            label_length_type.ndim == 1,
-            t_type.ndim == 2,
-            t_type.dtype == numpy.int32,
-            x_type.ndim == 3,
-            x_type.dtype.kind == 'f',
-        )
-        n_batch = x_type.shape[1]
-        type_check.expect(
-            t_type.shape[0] == n_batch,
-            input_length_type.shape[0] == n_batch,
-            label_length_type.shape[0] == n_batch,
-        )
+            // calculates log-sum-exp
+            T m = max(f1, max(f2, f3));
+            z = m + log(exp(f1 - m) + exp(f2 - m) + exp(f3 - m));
 
-    def log_matrix(self, x, xp):
-        if xp == numpy:
-            res = numpy.ma.log(x).filled(fill_value=self.zero_padding)
+            cum_prob += z;
+
+            int y_ind[] = {b, path[ind1]};
+            z += y[y_ind];
+            ''', 'ctc_transition'
+        )(prev_prob, path, path_length[:, None], zero_padding, y,
+            prob, cum_prob)
+    return prob
+
+
+def calc_trans(yseq, input_length,
+               label, label_length, path, path_length, zero_padding, xp):
+    max_input_length, n_batch, n_unit = yseq.shape
+    max_label_length = label.shape[1]
+    max_path_length = path.shape[1]
+    assert label.shape == (n_batch, max_label_length), label.shape
+    assert path.shape == (n_batch, max_label_length * 2 + 1)
+
+    forward_prob = xp.full(
+        (n_batch, max_path_length), zero_padding, dtype=yseq.dtype)
+    forward_prob[:, 0] = 0
+    backward_prob = forward_prob
+
+    batch_index = xp.arange(n_batch, dtype=int_dtype(xp))
+    seq_index = xp.arange(len(yseq), dtype=int_dtype(xp))
+    prob = yseq[seq_index[:, None, None], batch_index[:, None], path]
+    # forward computation.
+    for i, y in enumerate(yseq):
+        forward_prob = _computes_transition(
+            forward_prob, path, path_length, prob[i], y, zero_padding)
+
+    r_path = _flip_path(path, path_length, xp)
+
+    yseq_inv = _flip_label_probability(yseq, input_length, xp)
+    prob = _flip_path_probability(prob, input_length, path_length, xp)
+
+    for i, y_inv in enumerate(yseq_inv):
+        backward_prob = _computes_transition(
+            backward_prob, r_path, path_length, prob[i], y_inv, zero_padding)
+
+    return _flip_path_probability(prob, input_length, path_length, xp)
+
+
+class NaiveCTC(torch.autograd.function.Function):
+
+    @staticmethod
+    def forward(ctx, log_probs, targets, input_lengths, target_lengths, blank_symbol, reduction):
+        ctx.reduction = reduction
+
+        xp = get_array_module(log_probs)
+
+        if log_probs.dtype == numpy.float16:
+            zero_padding = -10000.0
         else:
-            create_recurrence_relation = cuda.elementwise(
-                'T x, T e', 'T y',
-                'y = x == 0 ? e : (T)log(x)',
-                'create_recurrence_relation')
-            res = create_recurrence_relation(x, self.zero_padding)
-        return res.astype(x.dtype, copy=False)
+            zero_padding = -10000000000.0
 
-    # path probability to label probability
-    def label_probability(self, label_size, path, path_length,
-                          multiply_seq, xp):
-        seq_length = len(multiply_seq)
-        n_batch = len(path)
-        dtype = multiply_seq.dtype
+        path_lengths = 2 * target_lengths + 1
 
-        ret = xp.zeros((seq_length, n_batch, label_size), dtype)
-        if xp == numpy:
-            for b in six.moves.range(len(path)):
-                target_path = path[b, :path_length[b]]
-                chars = {c for c in target_path}
-                for c in chars:
-                    ret[:, b, c] = xp.sum(
-                        multiply_seq[:, b, 0:path_length[b]]
-                        [:, target_path == c], axis=1)
+        # self.yseq = _softmax(xs, xp)
+        # log_yseq = self.log_matrix(self.yseq, xp)
+        path = _label_to_path(targets, blank_symbol, xp)
+        prob_trans = calc_trans(
+            log_probs, input_lengths, targets,
+            target_lengths, path, path_lengths, zero_padding, xp)
+
+        loss = -_logsumexp(prob_trans[0], xp, axis=1)
+        if ctx.reduction == 'mean':
+            loss = loss.mean()
+        ctx.save_for_backward(log_probs, targets, input_lengths, path_lengths, path, prob_trans)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        log_probs, targets, input_lengths, path_lengths, path, prob_trans = ctx.saved_tensors
+
+        xp = get_array_module(grad_output)
+        batch_size = targets.size(0)
+
+        total_probability = _logsumexp(prob_trans[0], xp, axis=1)
+        label_prob = label_probability(
+            log_probs.size(2), path, path_lengths,
+            xp.exp(prob_trans - total_probability[:, None]), xp)
+        yseq = log_probs.exp() - label_prob
+        if ctx.reduction == 'mean':
+            yseq *= grad_output[0] / batch_size
         else:
-            utils.nondeterministic('atomicAdd')
-            cuda.elementwise(
-                'T prob, I path, I path_length, I max_path_length',
-                'raw T cum_prob',
-                '''
-                I t = i % max_path_length;
-                if (t < path_length) {
-                  int n_batch = cum_prob.shape()[1];
-                  I s = i / (max_path_length * n_batch);
-                  I b = (i - s * (max_path_length * n_batch))
-                      / max_path_length;
-                  int ind[] = {s, b, path};
-                  atomicAdd(&cum_prob[ind], prob);
-                }
-                ''', 'ctc_label_prob_sum'
-            )(multiply_seq, path, path_length[:, None], path.shape[1], ret)
-        return ret
-
-    def _computes_transition(
-            self, prev_prob, path, path_length, cum_prob, y):
-        xp = backend.get_array_module(prev_prob)
-
-        if xp == numpy:
-            n_batch, max_path_length = path.shape
-            mat = xp.full(
-                (3, n_batch, max_path_length), self.zero_padding, y.dtype)
-            mat[0, :, :] = prev_prob
-            mat[1, :, 1:] = prev_prob[:, :-1]
-            mat[2, :, 2:] = prev_prob[:, :-2]
-            # disable transition between the same symbols
-            # (including blank-to-blank)
-            same_transition = (path[:, :-2] == path[:, 2:])
-            mat[2, :, 2:][same_transition] = self.zero_padding
-            prob = _logsumexp(mat, xp, axis=0)
-            outside = xp.arange(max_path_length) >= path_length[:, None]
-            prob[outside] = self.zero_padding
-            cum_prob += prob
-            batch_index = xp.arange(n_batch, dtype=xp.int32)
-            prob += y[batch_index[:, None], path]
-        else:
-            prob = xp.empty_like(prev_prob)
-            cuda.elementwise(
-                'raw T prob, raw I path, I path_length, T zero, raw T y',
-                'T z, T cum_prob',
-                '''
-                int length = prob.shape()[1];
-                int b = i / length;
-                int t = i - b * length;
-                if (t >= path_length) {
-                  z = zero;
-                  cum_prob += zero;
-                  return;
-                }
-                int ind1[] = {b, t};
-                int ind2[] = {b, t - 1};
-                int ind3[] = {b, t - 2};
-                T f1 = prob[ind1];
-                T f2 = (0 <= t - 1) ? prob[ind2] : zero;
-                T f3 = (0 <= t - 2 && path[ind3] != path[ind1]) ?
-                  prob[ind3] : zero;
-
-                // calculates log-sum-exp
-                T m = max(f1, max(f2, f3));
-                z = m + log(exp(f1 - m) + exp(f2 - m) + exp(f3 - m));
-
-                cum_prob += z;
-
-                int y_ind[] = {b, path[ind1]};
-                z += y[y_ind];
-                ''', 'ctc_transition'
-            )(prev_prob, path, path_length[:, None], self.zero_padding, y,
-              prob, cum_prob)
-        return prob
-
-    def calc_trans(self, yseq, input_length,
-                   label, label_length, path, path_length, xp):
-        max_input_length, n_batch, n_unit = yseq.shape
-        max_label_length = label.shape[1]
-        max_path_length = path.shape[1]
-        assert label.shape == (n_batch, max_label_length), label.shape
-        assert path.shape == (n_batch, max_label_length * 2 + 1)
-
-        forward_prob = xp.full(
-            (n_batch, max_path_length), self.zero_padding, dtype=yseq.dtype)
-        forward_prob[:, 0] = 0
-        backward_prob = forward_prob
-
-        batch_index = xp.arange(n_batch, dtype=xp.int32)
-        seq_index = xp.arange(len(yseq), dtype=xp.int32)
-        prob = yseq[seq_index[:, None, None], batch_index[:, None], path]
-        # forward computation.
-        for i, y in enumerate(yseq):
-            forward_prob = self._computes_transition(
-                forward_prob, path, path_length, prob[i], y)
-
-        r_path = _flip_path(path, path_length, xp)
-
-        yseq_inv = _flip_label_probability(yseq, input_length, xp)
-        prob = _flip_path_probability(prob, input_length, path_length, xp)
-
-        for i, y_inv in enumerate(yseq_inv):
-            backward_prob = self._computes_transition(
-                backward_prob, r_path, path_length, prob[i], y_inv)
-
-        return _flip_path_probability(prob, input_length, path_length, xp)
-
-    def forward(self, inputs):
-        xp = backend.get_array_module(inputs[0])
-        self.input_length, label_length, t, xs = inputs
-
-        if self.zero_padding is None:
-            if xs.dtype == numpy.float16:
-                self.zero_padding = -10000.0
-            else:
-                self.zero_padding = -10000000000.0
-
-        if chainer.is_debug():
-            assert len(xs) >= xp.max(self.input_length)
-            assert t.shape[1] >= xp.max(label_length)
-
-        self.path_length = 2 * label_length + 1
-
-        self.yseq = _softmax(xs, xp)
-        log_yseq = self.log_matrix(self.yseq, xp)
-        self.path = _label_to_path(t, self.blank_symbol, xp)
-        self.prob_trans = self.calc_trans(
-            log_yseq, self.input_length, t,
-            label_length, self.path, self.path_length, xp)
-
-        loss = -_logsumexp(self.prob_trans[0], xp, axis=1)
-        if self.reduce == 'mean':
-            loss = utils.force_array(xp.mean(loss))
-        return loss,
-
-    def backward(self, inputs, grad_output):
-        xp = backend.get_array_module(inputs[0])
-        batch_size = len(inputs[2])
-
-        total_probability = _logsumexp(self.prob_trans[0], xp, axis=1)
-        label_prob = self.label_probability(
-            self.yseq.shape[2], self.path, self.path_length,
-            xp.exp(self.prob_trans - total_probability[:, None]), xp)
-        self.yseq -= label_prob
-        if self.reduce == 'mean':
-            self.yseq *= grad_output[0] / batch_size
-        else:
-            self.yseq *= grad_output[0][..., None]
+            yseq *= grad_output[0][..., None]
         # mask
-        self.yseq *= (
-            xp.arange(len(self.yseq))[:, None] < self.input_length)[..., None]
-        return None, None, None, self.yseq
+        yseq *= (xp.arange(len(yseq))[:, None] < input_lengths)[..., None]
+
+        return yseq, None, None, None, None, None
 
 
-def connectionist_temporal_classification(
-        x, t, blank_symbol, input_length=None, label_length=None,
-        reduce='mean'):
-    """Connectionist Temporal Classification loss function.
-
-    Connectionist Temporal Classification(CTC) [Graves2006]_ is a loss function
-    of sequence labeling where the alignment between the inputs and target is
-    unknown. See also [Graves2012]_
-
-    The output is a variable whose value depends on the value of
-    the option ``reduce``. If it is ``'no'``, it holds the samplewise
-    loss values. If it is ``'mean'``, it takes the mean of loss values.
-
-
-    Args:
-        x (list or tuple of :class:`~chainer.Variable`):
-            A list of unnormalized probabilities for labels.
-            Each element of ``x``, ``x[i]`` is a :class:`~chainer.Variable`
-            object, which has shape ``(B, V)``, where ``B``
-            is the batch size and ``V`` is the number of labels.
-            The softmax of ``x[i]`` represents the probabilities of the labels
-            at time ``i``.
-        t (:class:`~chainer.Variable` or :ref:`ndarray`):
-            A matrix including expected label sequences.
-            Its shape is ``(B, M)``, where ``B`` is the batch size and ``M`` is
-            the maximum length of the label sequences.
-            All elements in ``t`` must be less than ``V``, the number of
-            labels.
-        blank_symbol (int): Index of blank_symbol.
-            This value must be non-negative.
-        input_length (:class:`~chainer.Variable` or :ref:`ndarray`):
-            Length of sequence for each of mini batch ``x`` (optional).
-            Its shape must be ``(B,)``.
-            If the ``input_length`` is omitted or ``None``, it assumes that
-            all of ``x`` is valid input.
-        label_length (:class:`~chainer.Variable` or :ref:`ndarray`):
-            Length of sequence for each of mini batch ``t`` (optional).
-            Its shape must be ``(B,)``.
-            If the ``label_length`` is omitted or ``None``, it assumes that
-            all of ``t`` is valid input.
-        reduce (str): Reduction option. Its value must be either
-            ``'mean'`` or ``'no'``. Otherwise,
-            :class:`ValueError` is raised.
-
-    Returns:
-       ~chainer.Variable:
-           A variable holding a scalar value of the CTC loss.
-           If ``reduce`` is ``'no'``, the output variable holds array
-           whose shape is `(B,)` where `B` is the number of samples.
-           If it is ``'mean'``, it holds a scalar.
-
-    .. note::
-       You need to input ``x`` without applying to activation functions(e.g.
-       softmax function), because this function applies softmax functions
-       to ``x`` before calculating CTC loss to avoid numerical limitations.
-       You also need to apply softmax function to forwarded values before you
-       decode it.
-
-    .. note::
-       This function is differentiable only by ``x``.
-
-    .. note::
-       This function supports (batch, sequence, 1-dimensional input)-data.
-
-    .. [Graves2006] Alex Graves, Santiago Fernandez,
-       Faustino Gomez, Jurgen Schmidhuber,
-       `Connectionist Temporal Classification: Labelling Unsegmented
-       Sequence Data with Recurrent Neural Networks
-       <ftp://ftp.idsia.ch/pub/juergen/icml2006.pdf>`_
-
-    .. [Graves2012] Alex Graves,
-       `Supervised Sequence Labelling with Recurrent Neural Networks
-       <https://www.cs.toronto.edu/~graves/preprint.pdf>`_
-
-    """
-    if not isinstance(x, collections_abc.Sequence):
-        raise TypeError('x must be a list of Variables')
-    if not isinstance(blank_symbol, int):
-        raise TypeError('blank_symbol must be non-negative integer.')
-    assert 0 <= blank_symbol < x[0].shape[1]
-    # This implementation only supports 1-dimensional data.
-    # TODO(jnishi): Support d(>1)-dimensional inputs.
-    assert x[0].ndim == 2
-
-    xp = backend.get_array_module(x[0])
-    if input_length is None:
-        input_length = xp.full(len(x[0]), len(x), dtype=numpy.int32)
-    if label_length is None:
-        label_length = xp.full(len(t), t.shape[1], dtype=numpy.int32)
-
-    return ConnectionistTemporalClassification(blank_symbol, reduce)(
-        input_length, label_length, t, chainer.functions.stack(x))
+def ctc_loss(log_probs, targets, input_lengths, target_lengths, blank : int = 0, reduction : str = 'none'):
+    """"""
+    return NaiveCTC.apply(log_probs, targets, input_lengths, target_lengths, blank, reduction)
