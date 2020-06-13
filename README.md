@@ -1,3 +1,7 @@
+I ported Chainer's implementation of CTC to torch without any tune-up. I found that it is a bit intricate and a bit slower than the original repository implementation. Thanks Chainer and vadimkantorov.
+
+*The original README is as follows.*
+
 A primer on CTC implementation in pure Python PyTorch code. This impl is not suitable for real-world usage, only for experimentation and research on CTC modifications. Features:
 - CTC impl is in Python and its only loop is over time steps (parallelizes over batch and symbol dimensions)
 - Gradients are computed via PyTorch autograd instead of a separate beta computation
