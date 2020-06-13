@@ -5,6 +5,8 @@ import torch
 import torch.nn.functional as F
 
 import ctc
+import chainer_ctc as c_ctc
+
 
 T, B, C = 128, 256, 32
 t = T // 2 - 4
@@ -45,6 +47,14 @@ toc = tictoc()
 custom_ctc_grad, = torch.autograd.grad(
     custom_ctc.sum(), logits, retain_graph=True)
 print('Custom CTC loss', 'fwd', toc - tic, 'bwd', tictoc() - toc)
+
+tic = tictoc()
+chainer_ctc = c_ctc.ctc_loss(
+    log_probs, targets, input_lengths, target_lengths, blank=0, reduction='none')
+toc = tictoc()
+chainer_ctc_grad, = torch.autograd.grad(
+    chainer_ctc.sum(), logits, retain_graph=True)
+print('Chainer CTC loss', 'fwd', toc - tic, 'bwd', tictoc() - toc)
 
 ce_alignment_targets = ctc.ctc_alignment_targets(
     log_probs, targets, input_lengths, target_lengths, blank=0)
